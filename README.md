@@ -91,7 +91,7 @@ echo "HDFS NameNode : http://localhost:9870"
 4. **Query** — open Trino UI and run `SELECT vendor_id, AVG(fare_amount) FROM hive.curated.nyc_trips GROUP BY 1`.
 5. **Visualize** — open Superset, the `nyc_trips` dataset is pre-registered. Build a chart in 30 seconds.
 
-Full walkthrough: [`docs/DEMO.md`](/lacerta15/cdp-lite-lakehouse/blob/main/docs/DEMO.md).
+Full walkthrough: [`docs/DEMO.md`](docs/DEMO.md).
 
 ## Deployment paths
 

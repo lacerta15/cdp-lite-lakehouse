@@ -1,0 +1,27 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cdp-lite
+  labels:
+    app.kubernetes.io/part-of: cdp-lite-lakehouse
+    app.kubernetes.io/managed-by: kubectl
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: lakehouse-env
+  namespace: cdp-lite
+data:
+  S3_ENDPOINT: "http://minio:9000"
+  HMS_URI: "thrift://hive-metastore:9083"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: lakehouse-creds
+  namespace: cdp-lite
+type: Opaque
+stringData:
+  MINIO_ROOT_USER: minio
+  MINIO_ROOT_PASSWORD: minio123
+  POSTGRES_PASSWORD: hive

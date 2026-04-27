@@ -1,0 +1,220 @@
+---
+# CDP-Lite auto-provision playbook
+# -------------------------------------------------------------------
+# Bootstraps a single RHEL/Rocky/Alma 8 or 9 host into a working
+# CDP-Lite Lakehouse environment:
+#   1. OS prerequisites + Cloudera-grade kernel tuning
+#   2. Docker CE + Compose plugin (or Podman + podman-compose fallback)
+#   3. Clone repo, render .env, bring stack up
+#   4. Smoke-test
+#
+# Run:
+#   ansible-playbook -i ansible/inventory.ini ansible/playbook.yml --diff
+#
+# Tags:
+#   --tags os        only OS prep
+#   --tags docker    only Docker install
+#   --tags app       only deploy the app
+#   --tags smoke     only run smoke tests
+- name: Provision CDP-Lite Lakehouse host
+  hosts: lakehouse
+  become: true
+  gather_facts: true
+
+  vars:
+    docker_compose_version: "v2.27.0"
+    required_packages:
+      - git
+      - curl
+      - jq
+      - python3
+      - python3-pip
+      - firewalld
+      - chrony
+    open_ports:
+      - { port: 9870, proto: tcp, comment: HDFS NameNode UI }
+      - { port: 9001, proto: tcp, comment: MinIO Console }
+      - { port: 9090, proto: tcp, comment: MinIO S3 API }
+      - { port: 8080, proto: tcp, comment: Spark Master UI }
+      - { port: 8081, proto: tcp, comment: Trino UI }
+      - { port: 8088, proto: tcp, comment: Superset UI }
+
+  tasks:
+
+    # ----------------------------------------------------------------
+    # 1. OS prep — Cloudera-style kernel tuning
+    # ----------------------------------------------------------------
+    - name: Install required packages
+      ansible.builtin.dnf:
+        name: "{{ required_packages }}"
+        state: present
+      tags: [os]
+
+    - name: Disable Transparent HugePages (Cloudera best practice)
+      ansible.builtin.shell: |
+        echo never > /sys/kernel/mm/transparent_hugepage/enabled
+        echo never > /sys/kernel/mm/transparent_hugepage/defrag
+      changed_when: false
+      tags: [os]
+
+    - name: Persist THP disable across reboots
+      ansible.builtin.copy:
+        dest: /etc/tuned/cdp-lite/tuned.conf
+        mode: "0644"
+        content: |
+          [main]
+          summary=CDP-Lite tuned profile
+          include=throughput-performance
+
+          [vm]
+          transparent_hugepages=never
+      tags: [os]
+
+    - name: Activate cdp-lite tuned profile
+      ansible.builtin.command: tuned-adm profile cdp-lite
+      changed_when: false
+      tags: [os]
+
+    - name: Apply Cloudera-recommended sysctl tunables
+      ansible.posix.sysctl:
+        name: "{{ item.name }}"
+        value: "{{ item.value }}"
+        sysctl_set: true
+        state: present
+        reload: true
+      loop:
+        - { name: vm.swappiness,                 value: "1" }
+        - { name: vm.dirty_ratio,                value: "40" }
+        - { name: vm.dirty_background_ratio,     value: "10" }
+        - { name: net.core.somaxconn,            value: "65535" }
+        - { name: net.ipv4.tcp_max_syn_backlog,  value: "65535" }
+        - { name: net.core.rmem_max,             value: "134217728" }
+        - { name: net.core.wmem_max,             value: "134217728" }
+      tags: [os]
+
+    - name: Enable & start chronyd (time sync is mandatory for HMS/Kerberos)
+      ansible.builtin.systemd:
+        name: chronyd
+        enabled: true
+        state: started
+      tags: [os]
+
+    # ----------------------------------------------------------------
+    # 2. Docker CE
+    # ----------------------------------------------------------------
+    - name: Add Docker CE repo
+      ansible.builtin.get_url:
+        url: https://download.docker.com/linux/centos/docker-ce.repo
+        dest: /etc/yum.repos.d/docker-ce.repo
+        mode: "0644"
+      tags: [docker]
+
+    - name: Install Docker CE + Compose plugin
+      ansible.builtin.dnf:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+        state: present
+      tags: [docker]
+
+    - name: Enable & start dockerd
+      ansible.builtin.systemd:
+        name: docker
+        enabled: true
+        state: started
+      tags: [docker]
+
+    - name: Add invoking user to docker group
+      ansible.builtin.user:
+        name: "{{ ansible_user }}"
+        groups: docker
+        append: true
+      tags: [docker]
+
+    # ----------------------------------------------------------------
+    # 3. Firewall
+    # ----------------------------------------------------------------
+    - name: Open required ports in firewalld
+      ansible.posix.firewalld:
+        port: "{{ item.port }}/{{ item.proto }}"
+        permanent: true
+        immediate: true
+        state: enabled
+      loop: "{{ open_ports }}"
+      tags: [os]
+
+    # ----------------------------------------------------------------
+    # 4. Deploy app
+    # ----------------------------------------------------------------
+    - name: Ensure project directory exists
+      ansible.builtin.file:
+        path: "{{ project_root }}"
+        state: directory
+        mode: "0755"
+      tags: [app]
+
+    - name: Clone CDP-Lite repo
+      ansible.builtin.git:
+        repo: "{{ git_repo }}"
+        dest: "{{ project_root }}"
+        version: "{{ git_branch }}"
+        force: true
+      tags: [app]
+
+    - name: Render .env from example (if missing)
+      ansible.builtin.copy:
+        src: "{{ project_root }}/.env.example"
+        dest: "{{ project_root }}/.env"
+        remote_src: true
+        force: false
+        mode: "0640"
+      tags: [app]
+
+    - name: docker compose pull
+      ansible.builtin.command:
+        cmd: docker compose pull
+        chdir: "{{ project_root }}"
+      changed_when: false
+      tags: [app]
+
+    - name: docker compose up -d
+      ansible.builtin.command:
+        cmd: docker compose up -d
+        chdir: "{{ project_root }}"
+      register: compose_up
+      changed_when: "'Started' in compose_up.stderr or 'Created' in compose_up.stderr"
+      tags: [app]
+
+    # ----------------------------------------------------------------
+    # 5. Smoke tests
+    # ----------------------------------------------------------------
+    - name: Wait for Trino to answer /v1/info
+      ansible.builtin.uri:
+        url: http://localhost:8081/v1/info
+        status_code: 200
+      register: trino_health
+      retries: 30
+      delay: 10
+      until: trino_health.status == 200
+      tags: [smoke]
+
+    - name: Wait for MinIO health
+      ansible.builtin.uri:
+        url: http://localhost:9090/minio/health/ready
+        status_code: 200
+      retries: 12
+      delay: 5
+      tags: [smoke]
+
+    - name: Print access URLs
+      ansible.builtin.debug:
+        msg:
+          - "MinIO Console : http://{{ inventory_hostname }}:9001  (minio/minio123)"
+          - "Spark Master  : http://{{ inventory_hostname }}:8080"
+          - "Trino UI      : http://{{ inventory_hostname }}:8081"
+          - "Superset      : http://{{ inventory_hostname }}:8088 (admin/admin)"
+          - "HDFS NameNode : http://{{ inventory_hostname }}:9870"
+      tags: [smoke]

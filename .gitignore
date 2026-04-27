@@ -1,0 +1,23 @@
+# Secrets & local state
+.env
+*.key
+*.pem
+
+# Data volumes & demo outputs
+data/_local/
+*.parquet
+*.orc
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Ansible
+*.retry

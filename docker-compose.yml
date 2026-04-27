@@ -1,0 +1,225 @@
+# CDP-Lite Mini Lakehouse — Docker Compose stack
+# Usage:  docker compose up -d
+# Tested with Docker 24+ and Docker Compose v2.20+
+#
+# Resource budget (approx): 6 GB RAM, 4 vCPU
+# All services are on a single bridge network `lakehouse-net` so they can
+# resolve each other by service name (CoreDNS-style).
+
+name: cdp-lite-lakehouse
+
+x-common-env: &common-env
+  TZ: Asia/Jakarta
+  CORE_CONF_fs_defaultFS: hdfs://namenode:9000
+
+networks:
+  lakehouse-net:
+    driver: bridge
+
+volumes:
+  hdfs_namenode:
+  hdfs_datanode:
+  minio_data:
+  postgres_data:
+  superset_data:
+
+services:
+  # ============================================================
+  # STORAGE LAYER
+  # ============================================================
+
+  namenode:
+    image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
+    container_name: lakehouse-namenode
+    hostname: namenode
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+      CLUSTER_NAME: cdp-lite
+    ports:
+      - "9870:9870"   # NameNode UI (HDFS RPC 9000 only exposed inside network to avoid MinIO clash)
+    volumes:
+      - hdfs_namenode:/hadoop/dfs/name
+    networks: [lakehouse-net]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9870/"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  datanode:
+    image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
+    container_name: lakehouse-datanode
+    hostname: datanode
+    restart: unless-stopped
+    depends_on:
+      namenode:
+        condition: service_healthy
+    environment:
+      <<: *common-env
+      SERVICE_PRECONDITION: "namenode:9870"
+    volumes:
+      - hdfs_datanode:/hadoop/dfs/data
+    networks: [lakehouse-net]
+
+  minio:
+    image: minio/minio:RELEASE.2024-08-29T01-40-52Z
+    container_name: lakehouse-minio
+    hostname: minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minio123}
+    ports:
+      - "9090:9000"   # MinIO S3 API on host port 9090
+      - "9001:9001"   # MinIO Console
+    volumes:
+      - minio_data:/data
+    networks: [lakehouse-net]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/ready"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # ============================================================
+  # CATALOG LAYER
+  # ============================================================
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: lakehouse-postgres
+    hostname: postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: metastore
+      POSTGRES_USER: hive
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-hive}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks: [lakehouse-net]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hive -d metastore"]
+      interval: 10s
+      retries: 5
+
+  hive-metastore:
+    build:
+      context: ./docker/hive-metastore
+    image: ${DOCKERHUB_USER:-local}/cdp-lite-hive-metastore:3.1.3
+    container_name: lakehouse-hms
+    hostname: hive-metastore
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      HIVE_METASTORE_DB_HOSTNAME: postgres
+      HIVE_METASTORE_DB_NAME: metastore
+      HIVE_METASTORE_DB_USER: hive
+      HIVE_METASTORE_DB_PASS: ${POSTGRES_PASSWORD:-hive}
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: ${MINIO_ROOT_USER:-minio}
+      S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minio123}
+    ports:
+      - "9083:9083"
+    networks: [lakehouse-net]
+
+  # ============================================================
+  # COMPUTE LAYER
+  # ============================================================
+
+  spark-master:
+    build:
+      context: ./docker/spark
+    image: ${DOCKERHUB_USER:-local}/cdp-lite-spark:3.5.0
+    container_name: lakehouse-spark-master
+    hostname: spark-master
+    restart: unless-stopped
+    # NOTE: We invoke spark-class directly (not sbin/start-master.sh) because
+    # the start-*.sh scripts daemonize and exit, which kills PID 1 in a container.
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.master.Master
+      - --host
+      - spark-master
+      - --port
+      - "7077"
+      - --webui-port
+      - "8080"
+    ports:
+      - "8080:8080"   # Spark Master UI
+      - "7077:7077"   # Spark master RPC
+    networks: [lakehouse-net]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/ >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  spark-worker:
+    image: ${DOCKERHUB_USER:-local}/cdp-lite-spark:3.5.0
+    container_name: lakehouse-spark-worker
+    hostname: spark-worker
+    restart: unless-stopped
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.worker.Worker
+      - --webui-port
+      - "8081"
+      - spark://spark-master:7077
+    environment:
+      SPARK_WORKER_CORES: 2
+      SPARK_WORKER_MEMORY: 2G
+    networks: [lakehouse-net]
+
+  trino:
+    image: trinodb/trino:435
+    container_name: lakehouse-trino
+    hostname: trino
+    restart: unless-stopped
+    depends_on:
+      hive-metastore:
+        condition: service_started
+    ports:
+      - "8081:8080"   # Trino UI (mapped to 8081 to avoid Spark clash)
+    volumes:
+      - ./config/trino:/etc/trino
+    networks: [lakehouse-net]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/v1/info"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+
+  # ============================================================
+  # ACCESS LAYER
+  # ============================================================
+
+  superset:
+    build:
+      context: ./docker/superset
+    image: ${DOCKERHUB_USER:-local}/cdp-lite-superset:3.0.1
+    container_name: lakehouse-superset
+    hostname: superset
+    restart: unless-stopped
+    depends_on:
+      trino:
+        condition: service_healthy
+    environment:
+      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY:-change-me-please-32-chars-min!!}
+      ADMIN_USERNAME: admin
+      ADMIN_EMAIL: admin@cdp-lite.local
+      ADMIN_PASSWORD: ${SUPERSET_ADMIN_PASSWORD:-admin}
+    ports:
+      - "8088:8088"
+    volumes:
+      - superset_data:/app/superset_home
+    networks: [lakehouse-net]

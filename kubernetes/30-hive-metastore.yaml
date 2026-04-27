@@ -1,0 +1,54 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hive-metastore
+  namespace: cdp-lite
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hive-metastore
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: hive-metastore
+    spec:
+      containers:
+        - name: hive-metastore
+          image: REGISTRY/cdp-lite-hive-metastore:3.1.3   # set with `kustomize edit set image`
+          env:
+            - { name: HIVE_METASTORE_DB_HOSTNAME, value: postgres }
+            - { name: HIVE_METASTORE_DB_NAME,     value: metastore }
+            - { name: HIVE_METASTORE_DB_USER,     value: hive }
+            - name: HIVE_METASTORE_DB_PASS
+              valueFrom:
+                secretKeyRef: { name: lakehouse-creds, key: POSTGRES_PASSWORD }
+            - name: S3_ENDPOINT
+              valueFrom:
+                configMapKeyRef: { name: lakehouse-env, key: S3_ENDPOINT }
+            - name: S3_ACCESS_KEY
+              valueFrom:
+                secretKeyRef: { name: lakehouse-creds, key: MINIO_ROOT_USER }
+            - name: S3_SECRET_KEY
+              valueFrom:
+                secretKeyRef: { name: lakehouse-creds, key: MINIO_ROOT_PASSWORD }
+          ports:
+            - { containerPort: 9083, name: thrift }
+          readinessProbe:
+            tcpSocket: { port: 9083 }
+            initialDelaySeconds: 60
+            periodSeconds: 10
+          resources:
+            requests: { cpu: "200m", memory: "512Mi" }
+            limits:   { cpu: "1",    memory: "1Gi" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hive-metastore
+  namespace: cdp-lite
+spec:
+  selector:
+    app.kubernetes.io/name: hive-metastore
+  ports:
+    - { port: 9083, targetPort: 9083 }

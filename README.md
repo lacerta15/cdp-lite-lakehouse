@@ -139,6 +139,5 @@ cdp-lite-lakehouse/
 - [ ] OpenShift Operator
 
 ## About Me
-Built by a Cloudera CDP and Red Hat DevOps practitioner. 
 Find more at [LinkedIn →](https://www.linkedin.com/in/merdias-fajar-aab4301b1/).
 
